@@ -1,10 +1,11 @@
 name: GLaDOS 2026 Checkin
 
+# cron-job.org calls this workflow; it now sends a manual check-in reminder only.
 on:
   workflow_dispatch:
     inputs:
       dispatch_source:
-        description: 手动运行请选择 manual；外部定时器可不填（默认按 external）
+        description: 手动测试选 manual；外部定时器使用 external
         required: false
         default: external
         type: choice
@@ -12,7 +13,7 @@ on:
           - manual
           - external
       diagnose_only:
-        description: 只检查 Cookie 是否可读取账号状态，不签到、不兑换、不推送
+        description: 仅验证工作流，不发送微信提醒
         required: false
         default: false
         type: boolean
@@ -21,45 +22,71 @@ concurrency:
   group: glados-checkin
   cancel-in-progress: false
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  checkin:
-    if: github.event_name == 'schedule' || inputs.dispatch_source == 'manual' || inputs.dispatch_source == 'external'
+  reminder:
+    name: 微信手动签到提醒
+    if: ${{ !inputs.diagnose_only }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 3
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install Dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Run Tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Run Checkin
-        run: python checkin.py
-        timeout-minutes: 8
+      - name: Send WeChat reminder
         env:
-          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          # Must match the browser that created the current gld:sess.
-          # Prefer the repository Variable; accept a same-named Secret for compatibility.
-          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT || secrets.GLADOS_USER_AGENT }}
-          CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PUSH_LEVEL: ${{ vars.PUSH_LEVEL || 'fail_only' }}
-          EXCHANGE_PLAN: ${{ vars.EXCHANGE_PLAN || 'plan500' }}
-          CHECKIN_MAX_ATTEMPTS: '3'
-          CHECKIN_RETRY_DELAY_SECONDS: '60'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          key = os.environ.get("SERVERCHAN_SENDKEY", "").strip()
+          match = re.fullmatch(r"sctp([0-9]+)t[A-Za-z0-9_-]+", key)
+          if match:
+              host = f"{match.group(1)}.push.ft07.com"
+          elif re.fullmatch(r"SCT[A-Za-z0-9_-]+", key):
+              host = "sctapi.ftqq.com"
+          else:
+              print("ERROR: SERVERCHAN_SENDKEY is missing or has an invalid format.")
+              sys.exit(1)
+
+          now = datetime.now(timezone(timedelta(hours=8)))
+          description = (
+              f"北京时间：{now:%Y-%m-%d %H:%M}\n\n"
+              "请用手机打开 GLaDOS 官网，完成页面上的真人验证并手动签到。\n\n"
+              "[点击打开官网签到页](https://glados.cloud/console/checkin)\n\n"
+              "此消息仅为每日提醒，不代表今日已经签到。"
+              "本工作流不会请求签到接口，也不会兑换积分。"
+              "若今天已经签到，可以忽略。"
+          )
+          data = urllib.parse.urlencode({
+              "title": "GLaDOS 手动签到提醒",
+              "desp": description,
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              f"https://{host}/{key}.send",
+              data=data,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  result = json.load(response)
+          except urllib.error.HTTPError as error:
+              print(f"ERROR: WeChat reminder request returned HTTP {error.code}.")
+              sys.exit(1)
+          except Exception as error:
+              # Exception messages and request URLs may contain the SendKey.
+              print(f"ERROR: WeChat reminder request failed ({type(error).__name__}).")
+              sys.exit(1)
+          if not isinstance(result, dict) or result.get("code") != 0:
+              print("ERROR: ServerChan did not accept the reminder.")
+              sys.exit(1)
+          print("ServerChan accepted the reminder; delivery is confirmed on your phone.")
+          PY
